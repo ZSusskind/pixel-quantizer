@@ -1,3 +1,4 @@
 *.swp
 *.jpg
 env/
+__pycache__/

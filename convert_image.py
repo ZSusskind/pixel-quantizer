@@ -24,9 +24,11 @@ def parse_arguments():
                         help="Specify palette colors in hex format")
     parser.add_argument("--specific_accents", nargs="+",
                         help="Ditto, but for accents")
-    parser.add_argument("--denoise", action="store_true",
-                        help="Attempts to smooth spurious \"outcroppings\" on palette color region boundaries")
-    parser.add_argument("--dither", action="store_true", help="Use dithering to smooth palette color transitions")
+    parser.add_argument("--denoise", type=int, default=0,
+                        help="Attempts to smooth spurious \"outcroppings\" on palette color region boundaries; "\
+                        "higher values will try more and larger regions")
+    parser.add_argument("--dither", type=int, default=0, choices=[0, 1, 2, 4],
+                        help="Use dithering to smooth palette color transitions; higher levels give stronger effects")
     parser.add_argument("--quantize", type=int, nargs=3, default=[8, 8, 8],
                         help="Specify bit depth separately for R/G/B channels (1-8); "\
                         "with very low values, the final palette may have fewer colors than desired")
@@ -73,28 +75,50 @@ def make_palette(num_colors, data, extra_colors):
         palette = extra_colors
     return palette
 
+def quantize_to_palette(palette, colors, mask=None, mask_start=None):
+    deltas = palette.reshape(1, -1, 3) - colors.reshape(-1, 1, 3)
+    delta_norm = (deltas**2).sum(axis=2)
+    if mask is not None:
+        delta_norm[mask, mask_start:] = np.inf
+    labels = delta_norm.argmin(axis=1)
+    return labels
+
 @njit(parallel=True)
-def run_denoising(img_x, img_y, ori_edge, img_labels, palettized, final_palette, kernel_size, threshold):
+def run_denoising(img_x, img_y, ori_edge, img_labels, kernel_size, threshold):
     assert(kernel_size%2 == 1)
     kernel_pad = kernel_size // 2
     done = False
     iter = 0
     while not done:
-        if iter == 10:
+        if iter == 20:
             break
         done = True
         for x in prange(kernel_pad, img_x-kernel_pad):
             for y in range(kernel_pad, img_y-kernel_pad):
                 if ori_edge[x, y]:
                     continue
-                neighbor_labels = [img_labels[i, j] for i in range(x-kernel_pad,x+kernel_pad+1)
-                                                    for j in range(y-kernel_pad,y+kernel_pad+1)]
-                count = np.bincount(neighbor_labels)
-                if count.max() >= threshold:
-                    new_label = count.argmax()
+                #neighbor_edges = ori_edge[x-kernel_pad:x+kernel_pad+1,
+                #                          y-kernel_pad:y+kernel_pad+1].flatten()
+                #if neighbor_edges.any():
+                #    continue
+                neighbor_labels = img_labels[x-kernel_pad:x+kernel_pad+1,
+                                             y-kernel_pad:y+kernel_pad+1].flatten()
+                #values, counts = np.unique(neighbor_labels, return_counts=True)
+                values = np.unique(neighbor_labels)
+                max_value = 0
+                max_count = 0
+                for v in values:
+                    count = (neighbor_labels == v).sum()
+                    if count > max_count:
+                        max_count = count
+                        max_value = v
+
+                #max_count = counts.max()
+                #max_value = values[counts.argmax()]
+                if max_count >= threshold:
+                    new_label = max_value
                     if new_label != img_labels[x, y]:
                         img_labels[x, y] = new_label
-                        palettized[x, y] = final_palette[new_label]
                         done = False
         iter += 1
 
@@ -109,6 +133,8 @@ def convert(in_fname, out_fname, block_size, palette_size, accent_size,
     assert(quantize.min() >= 1)
     assert(quantize.max() <= 8)
     assert(0 < accent_percentile < 100)
+    if (denoise == 0) and (dither > 1):
+        print("NOTE: Using dithering > 1 without denoising is not recommended")
 
     image = ski.io.imread(in_fname)
 
@@ -131,11 +157,9 @@ def convert(in_fname, out_fname, block_size, palette_size, accent_size,
 
     if (accent_size > 0) or ((specific_accents is not None) and (len(specific_accents) > 0)):
         print("Evaluating base palette badness")
-        base_color_deltas = base_palette.reshape(1, -1, 3) - weighted.reshape(-1, 1, 3)
-        base_delta_norm = (base_color_deltas**2).sum(axis=2)
-        base_labels = base_delta_norm.argmin(axis=1)
+        base_labels = quantize_to_palette(base_palette, weighted)
         base_palettized_linear = base_palette[base_labels]
-        badness = (np.abs(base_palettized_linear-weighted)**2).sum(axis=1)
+        badness = ((base_palettized_linear-weighted)**2).sum(axis=1)
         bad_threshold = np.percentile(badness, accent_percentile) * .95
         bad_mask = badness >= bad_threshold
         print(f"  Mean badness of {round(badness.mean(), 3)}; "\
@@ -151,31 +175,68 @@ def convert(in_fname, out_fname, block_size, palette_size, accent_size,
 
     weighted_palette = np.concatenate((base_palette, accent_palette) , axis=0)
     print("Applying palette to image")
-    color_deltas = weighted_palette.reshape(1, -1, 3) - weighted.reshape(-1, 1, 3)
-    delta_norm = (color_deltas**2).sum(axis=2)
-    delta_norm[~bad_mask, len(base_palette):] = np.inf # Non-accent pixels can't have accent colors
-    labels = delta_norm.argmin(axis=1)
+    labels = quantize_to_palette(weighted_palette, weighted, ~bad_mask, len(base_palette))
     img_labels = labels.reshape(img_x, img_y)
     final_palette = weighted_palette / color_weights
     final_palette = np.clip(np.round(final_palette * ((1<<quantize)-1)) / ((1<<quantize)-1), 0.0, 0.9999)
+    assert(final_palette.min() >= 0)
+    assert(final_palette.max() < 1)
     palettized = final_palette[labels].reshape(downscaled.shape)
-    assert(palettized.min() >= 0)
-    assert(palettized.max() < 1)
 
-    if denoise or dither:
-        print("Run edge detection on original and final images")
+    if (denoise > 0) or (dither > 0):
         ori_edge = ski.filters.scharr(downscaled).max(axis=2) > 0.1
-        pal_edge = ski.filters.scharr(palettized).max(axis=2) > 0.1
-        diff_edge = pal_edge & ~ori_edge # Spurious edges added by palettization
 
-        if denoise:
-            print("Run denoising with kernel 3")
-            run_denoising(img_x, img_y, ori_edge, img_labels, palettized, final_palette, 3, 8)
-            print("Run denoising with kernel 5")
-            run_denoising(img_x, img_y, ori_edge, img_labels, palettized, final_palette, 5, 21)
+        if dither >= 2:
+            print("Running 2:2 dithering")
+            assignment_result = weighted_palette[img_labels.flatten()]
+            assignment_error = assignment_result - weighted
+            assignment_badness = (assignment_error**2).sum(axis=1)
+            
+            assignment_correction = weighted - assignment_error
+            #corrected_labels = quantize_to_palette(weighted_palette, assignment_correction,
+            #                                       ~bad_mask, len(base_palette))
+            corrected_labels = quantize_to_palette(base_palette, assignment_correction)
+            corrected_img_labels = corrected_labels.reshape(img_x, img_y)
+            corrected_error = (weighted_palette[corrected_labels] - weighted)
 
-        if dither:
-            print("Run dithering")
+            half_corrected_error = (corrected_error + assignment_error) / 2
+            half_corrected_badness = (half_corrected_error**2).sum(axis=1)
+            half_correction_mask = (half_corrected_badness < assignment_badness).reshape(img_x, img_y)
+            #half_correction_mask = np.logical_and(half_correction_mask, ~ori_edge)
+
+            if dither >= 4:
+                print("Running 3:1 dithering")
+                quarter_corrected_error = (corrected_error + 3*assignment_error) / 4
+                quarter_corrected_badness = (quarter_corrected_error**2).sum(axis=1)
+                best_badness = np.minimum(assignment_badness, half_corrected_badness)
+                quarter_correction_mask = (quarter_corrected_badness < best_badness).reshape(img_x, img_y)
+                #quarter_correction_mask = np.logical_and(quarter_correction_mask, ~ori_edge)
+                half_correction_mask[quarter_correction_mask] = False
+            else:
+                quarter_correction_mask = np.zeros((img_x, img_y)).astype(bool)
+
+            assert(not np.logical_and(half_correction_mask, quarter_correction_mask).any())
+            
+            # Create "meta" labels for dithered colors
+            img_labels[half_correction_mask] += ((corrected_img_labels+1)\
+                * len(final_palette))[half_correction_mask]
+            img_labels[quarter_correction_mask] += ((corrected_img_labels+len(final_palette)+1)\
+                * len(final_palette))[quarter_correction_mask]
+
+        if (denoise > 0):
+            print("Running denoising")
+            for i in range(denoise):
+                k = (2*i) + 3
+                t = int(np.round(.85*k**2))
+                #print(f"Running denoising with kernel {k} and threshold {t}")
+                run_denoising(img_x, img_y, ori_edge, img_labels, k, t)
+        
+        if dither == 1:
+            print("Running edge dithering")
+            pal_edge = ski.filters.scharr(palettized).max(axis=2) > 0.1
+            diff_edge = pal_edge & ~ori_edge # Spurious edges added by palettization
+
+            new_img_labels = img_labels.copy()
             for x in range(img_x):
                 for y in range(img_y):
                     if not diff_edge[x, y]:
@@ -184,14 +245,42 @@ def convert(in_fname, out_fname, block_size, palette_size, accent_size,
                        and (y%2 == 0)\
                        and (img_labels[x-1, y] != img_labels[x, y])\
                        and not ori_edge[x-1, y]:
-                        palettized[x-1, y] = final_palette[img_labels[x, y]]
-                        palettized[x, y] = final_palette[img_labels[x-1, y]]
+                        new_img_labels[x-1, y] = img_labels[x, y]
+                        new_img_labels[x, y] = img_labels[x-1, y]
                     elif (y > 0)\
                        and (x%2 == 0)\
                        and (img_labels[x, y-1] != img_labels[x, y])\
                        and not ori_edge[x, y-1]:
-                        palettized[x, y-1] = final_palette[img_labels[x, y]]
-                        palettized[x, y] = final_palette[img_labels[x, y-1]]
+                        new_img_labels[x, y-1] = img_labels[x, y]
+                        new_img_labels[x, y] = img_labels[x, y-1]
+            img_labels = new_img_labels
+        
+        half_correction_mask = np.logical_and((img_labels >= len(final_palette)),
+                                              (img_labels < len(final_palette)*(len(final_palette)+1)))
+        quarter_correction_mask = img_labels >= len(final_palette)*(len(final_palette)+1)
+        correction_mask = np.logical_or(half_correction_mask, quarter_correction_mask)
+    
+        corrected_img_labels = ((img_labels // len(final_palette))-1) % len(final_palette)
+        img_labels %= len(final_palette)
+
+        half_mask_x = (-1) ** np.arange(img_x)
+        half_mask_y = (-1) ** np.arange(img_y)
+        half_diag_mask = (1 - (half_mask_x.reshape(-1, 1) * half_mask_y.reshape(1, -1))).astype(bool)
+        half_sort_mask = np.where(img_labels < corrected_img_labels, half_diag_mask, ~half_diag_mask)
+        half_dither_mask = np.logical_and(half_correction_mask, half_sort_mask)
+                
+        quarter_mask_x = (1 - ((-1) ** np.arange(img_x)))//2
+        quarter_mask_y = (1 - ((-1) ** np.arange(img_y)))//2
+        quarter_diag_mask = (quarter_mask_x.reshape(-1, 1) * (1-quarter_mask_y).reshape(1, -1)).astype(bool)
+        inv_quarter_diag_mask = (quarter_mask_x.reshape(-1, 1) * quarter_mask_y.reshape(1, -1)).astype(bool)
+        quarter_sort_mask = np.where(img_labels < corrected_img_labels, quarter_diag_mask, inv_quarter_diag_mask)
+        assert((np.logical_and(quarter_sort_mask, half_sort_mask) == quarter_sort_mask).all())
+        quarter_dither_mask = np.logical_and(quarter_correction_mask, quarter_sort_mask)
+
+        dither_mask = np.logical_or(half_dither_mask, quarter_dither_mask)
+
+        img_labels = np.where(dither_mask, corrected_img_labels, img_labels)
+        palettized = final_palette[img_labels.flatten()].reshape(downscaled.shape)
 
     print("All done!")
     save_file(out_fname, palettized, block_size)
