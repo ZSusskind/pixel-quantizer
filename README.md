@@ -1,6 +1,6 @@
 ![Example using PC-9800 palette (16 colors from 12-bit palette); original image is by user Argash [here](https://commons.wikimedia.org/wiki/File:Austin_Evening.jpg)](example/highlight_pc98.png)
 
-Automatically quantize and pixellate an image
+Automatically quantize and pixelate an image
 
 TODO: Write better README
 
