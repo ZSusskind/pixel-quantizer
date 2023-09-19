@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
-import colorsys
 import numpy as np
 import skimage as ski
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.ensemble import IsolationForest
 from numba import njit, prange
+
+import vcolor
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Automatically convert image to pixel art")
@@ -52,14 +53,13 @@ def saturate_and_tint(linear, saturation, tint_hue, tint_strength):
     assert(saturation >= 0.0)
     assert(0 <= tint_hue < 360)
     assert(0 <= tint_strength <= 1)
-    for i in range(len(linear)):
-        hls = list(colorsys.rgb_to_hls(linear[i,0], linear[i,1], linear[i,2]))
-        if saturation <= 1.0:
-            hls[2] = saturation*hls[2]
-        else:
-            hls[2] = hls[2]**(1/saturation)
-        hls[0] = (1.0 - tint_strength) * hls[0] + tint_strength * (tint_hue / 360)
-        linear[i] = np.array(colorsys.hls_to_rgb(*hls))
+    hls = vcolor.vector_rgb_to_hls(linear)
+    if saturation <= 1.0:
+        hls[2] = saturation*hls[2]
+    else:
+        hls[2] = hls[2]**(1/saturation)
+    hls[0] = (1.0 - tint_strength) * hls[0] + tint_strength * (tint_hue / 360)
+    return vcolor.vector_hls_to_rgb(hls)
 
 def make_palette(num_colors, data, extra_colors):
     if num_colors > 0:
@@ -121,7 +121,7 @@ def convert(in_fname, out_fname, block_size, palette_size, accent_size,
     linear = downscaled.reshape(-1, 3)
     if (saturation != 1.0) or (tint_strength != 0.0):
         print("Adjust saturation and tint")
-        saturate_and_tint(linear, saturation, tint_hue, tint_strength)
+        linear = saturate_and_tint(linear, saturation, tint_hue, tint_strength)
 
     weighted = linear * color_weights
     
