@@ -57,10 +57,10 @@ def saturate_and_tint(linear, saturation, tint_hue, tint_strength):
     assert(0 <= tint_strength <= 1)
     hls = vcolor.vector_rgb_to_hls(linear)
     if saturation <= 1.0:
-        hls[2] = saturation*hls[2]
+        hls[:,2] = saturation*hls[:,2]
     else:
-        hls[2] = hls[2]**(1/saturation)
-    hls[0] = (1.0 - tint_strength) * hls[0] + tint_strength * (tint_hue / 360)
+        hls[:,2] = hls[:,2]**(1/saturation)
+    hls[:,0] = (1.0 - tint_strength) * hls[:,0] + tint_strength * (tint_hue / 360)
     return vcolor.vector_hls_to_rgb(hls)
 
 def make_palette(num_colors, data, extra_colors):
@@ -68,7 +68,7 @@ def make_palette(num_colors, data, extra_colors):
         kmeans = MiniBatchKMeans(n_clusters=num_colors, random_state=0, n_init="auto", batch_size=1<<17)
         kmeans = kmeans.fit(data)
         palette = kmeans.cluster_centers_
-        if specific_colors is not None:
+        if extra_colors is not None:
             palette = np.concatenate((palette, extra_colors), axis=0)
     else:
         assert((extra_colors is not None) and (len(extra_colors) > 0))
@@ -150,6 +150,10 @@ def convert(in_fname, out_fname, block_size, palette_size, accent_size,
         linear = saturate_and_tint(linear, saturation, tint_hue, tint_strength)
 
     weighted = linear * color_weights
+    if specific_colors is not None:
+        specific_colors *= color_weights
+    if specific_accents is not None:
+        specific_accents *= color_weights
     
     print("Determining base palette")
     base_palette_size = palette_size - accent_size
@@ -193,9 +197,9 @@ def convert(in_fname, out_fname, block_size, palette_size, accent_size,
             assignment_badness = (assignment_error**2).sum(axis=1)
             
             assignment_correction = weighted - assignment_error
-            #corrected_labels = quantize_to_palette(weighted_palette, assignment_correction,
-            #                                       ~bad_mask, len(base_palette))
-            corrected_labels = quantize_to_palette(base_palette, assignment_correction)
+            corrected_labels = quantize_to_palette(weighted_palette, assignment_correction,
+                                                   ~bad_mask, len(base_palette))
+            #corrected_labels = quantize_to_palette(base_palette, assignment_correction)
             corrected_img_labels = corrected_labels.reshape(img_x, img_y)
             corrected_error = (weighted_palette[corrected_labels] - weighted)
 
